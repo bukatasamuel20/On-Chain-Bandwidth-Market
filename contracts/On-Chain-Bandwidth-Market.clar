@@ -7,6 +7,10 @@
 (define-constant err-expired (err u105))
 (define-constant err-insufficient-bandwidth (err u106))
 
+(define-constant err-subscription-exists (err u107))
+(define-constant err-subscription-inactive (err u108))
+(define-constant err-renewal-too-early (err u109))
+
 (define-map bandwidth-listings
   { listing-id: uint }
   { 
@@ -206,6 +210,150 @@
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (try! (as-contract (stx-transfer? (stx-get-balance tx-sender) tx-sender contract-owner)))
+    (ok true)
+  )
+)
+
+
+(define-map bandwidth-subscriptions
+  { subscription-id: uint }
+  {
+    subscriber: principal,
+    provider: principal,
+    bandwidth-gb: uint,
+    price-per-gb: uint,
+    renewal-blocks: uint,
+    next-renewal-block: uint,
+    active: bool,
+    auto-renew: bool
+  }
+)
+
+(define-map subscription-history
+  { subscriber: principal, provider: principal }
+  {
+    total-renewals: uint,
+    total-paid: uint,
+    current-subscription-id: (optional uint)
+  }
+)
+
+(define-data-var next-subscription-id uint u1)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? bandwidth-subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-subscription-history (subscriber principal) (provider principal))
+  (default-to
+    { total-renewals: u0, total-paid: u0, current-subscription-id: none }
+    (map-get? subscription-history { subscriber: subscriber, provider: provider })
+  )
+)
+
+(define-read-only (is-renewal-due (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription (and 
+                   (get active subscription)
+                   (<= (get next-renewal-block subscription) stacks-block-height))
+    false
+  )
+)
+
+(define-public (create-subscription (provider principal) (bandwidth-gb uint) (price-per-gb uint) (renewal-blocks uint))
+  (let ((subscription-id (var-get next-subscription-id))
+        (next-renewal (+ stacks-block-height renewal-blocks))
+        (total-cost (calculate-total-cost bandwidth-gb price-per-gb)))
+    
+    (asserts! (> bandwidth-gb u0) err-invalid-bandwidth)
+    (asserts! (> price-per-gb u0) err-invalid-bandwidth)
+    (asserts! (> renewal-blocks u100) err-invalid-bandwidth)
+    
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    
+    (map-set bandwidth-subscriptions
+      { subscription-id: subscription-id }
+      {
+        subscriber: tx-sender,
+        provider: provider,
+        bandwidth-gb: bandwidth-gb,
+        price-per-gb: price-per-gb,
+        renewal-blocks: renewal-blocks,
+        next-renewal-block: next-renewal,
+        active: true,
+        auto-renew: true
+      }
+    )
+    
+    (map-set subscription-history
+      { subscriber: tx-sender, provider: provider }
+      (let ((history (get-subscription-history tx-sender provider)))
+        {
+          total-renewals: (+ (get total-renewals history) u1),
+          total-paid: (+ (get total-paid history) total-cost),
+          current-subscription-id: (some subscription-id)
+        }
+      )
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (renew-subscription (subscription-id uint))
+  (let ((subscription (unwrap! (get-subscription subscription-id) err-not-found))
+        (total-cost (calculate-total-cost (get bandwidth-gb subscription) (get price-per-gb subscription))))
+    
+    (asserts! (get active subscription) err-subscription-inactive)
+    (asserts! (is-renewal-due subscription-id) err-renewal-too-early)
+    
+    (try! (stx-transfer? total-cost (get subscriber subscription) (as-contract tx-sender)))
+    
+    (map-set bandwidth-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { 
+        next-renewal-block: (+ (get next-renewal-block subscription) (get renewal-blocks subscription))
+      })
+    )
+    
+    (map-set subscription-history
+      { subscriber: (get subscriber subscription), provider: (get provider subscription) }
+      (let ((history (get-subscription-history (get subscriber subscription) (get provider subscription))))
+        {
+          total-renewals: (+ (get total-renewals history) u1),
+          total-paid: (+ (get total-paid history) total-cost),
+          current-subscription-id: (get current-subscription-id history)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (toggle-auto-renew (subscription-id uint))
+  (let ((subscription (unwrap! (get-subscription subscription-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-owner-only)
+    
+    (map-set bandwidth-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { auto-renew: (not (get auto-renew subscription)) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let ((subscription (unwrap! (get-subscription subscription-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-owner-only)
+    
+    (map-set bandwidth-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { active: false })
+    )
+    
     (ok true)
   )
 )
