@@ -11,6 +11,9 @@
 (define-constant err-subscription-inactive (err u108))
 (define-constant err-renewal-too-early (err u109))
 
+(define-constant err-self-referral (err u120))
+(define-constant err-referrer-exists (err u121))
+
 (define-map bandwidth-listings
   { listing-id: uint }
   { 
@@ -354,6 +357,91 @@
       (merge subscription { active: false })
     )
     
+    (ok true)
+  )
+)
+
+(define-map user-referrers
+  { user: principal }
+  { referrer: principal }
+)
+
+(define-constant referral-share-bps u5000)
+
+(define-read-only (get-referrer (user principal))
+  (map-get? user-referrers { user: user })
+)
+
+(define-public (set-referrer (referrer principal))
+  (begin
+    (asserts! (not (is-eq tx-sender referrer)) err-self-referral)
+    (asserts! (is-none (map-get? user-referrers { user: tx-sender })) err-referrer-exists)
+    (map-set user-referrers { user: tx-sender } { referrer: referrer })
+    (ok true)
+  )
+)
+
+(define-public (purchase-with-referral (listing-id uint) (requested-gb uint) (duration-blocks uint))
+  (let (
+        (listing (unwrap! (get-listing listing-id) err-not-found))
+        (total-cost (calculate-total-cost requested-gb (get price-per-gb listing)))
+        (platform-fee (/ (* total-cost (var-get platform-fee-rate)) u10000))
+        (provider-payment (- total-cost platform-fee))
+        (ref-opt (map-get? user-referrers { user: tx-sender }))
+      )
+    (asserts! (is-listing-active listing-id) err-expired)
+    (asserts! (<= requested-gb (get bandwidth-gb listing)) err-insufficient-bandwidth)
+    (asserts! (> requested-gb u0) err-invalid-bandwidth)
+    (asserts! (> duration-blocks u0) err-invalid-bandwidth)
+
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? provider-payment tx-sender (get provider listing))))
+
+    (match ref-opt
+      ref-data
+        (begin
+          (let ((reward (/ (* platform-fee referral-share-bps) u10000)))
+            (try! (as-contract (stx-transfer? reward tx-sender (get referrer ref-data)))))
+          true)
+      true
+    )
+
+    (map-set user-allocations
+      { user: tx-sender, listing-id: listing-id }
+      {
+        allocated-gb: requested-gb,
+        start-block: stacks-block-height,
+        duration-blocks: duration-blocks,
+        total-paid: total-cost
+      }
+    )
+
+    (map-set bandwidth-listings
+      { listing-id: listing-id }
+      (merge listing { bandwidth-gb: (- (get bandwidth-gb listing) requested-gb) })
+    )
+
+    (map-set provider-stats
+      { provider: (get provider listing) }
+      (let ((ps (get-provider-stats (get provider listing))))
+        {
+          total-listings: (get total-listings ps),
+          total-earned: (+ (get total-earned ps) provider-payment),
+          total-bandwidth-sold: (+ (get total-bandwidth-sold ps) requested-gb)
+        }
+      )
+    )
+
+    (map-set buyer-stats
+      { buyer: tx-sender }
+      (let ((bs (get-buyer-stats tx-sender)))
+        {
+          total-purchases: (+ (get total-purchases bs) u1),
+          total-spent: (+ (get total-spent bs) total-cost),
+          total-bandwidth-bought: (+ (get total-bandwidth-bought bs) requested-gb)
+        }
+      )
+    )
     (ok true)
   )
 )
